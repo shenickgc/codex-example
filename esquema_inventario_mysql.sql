@@ -185,3 +185,102 @@ INSERT INTO usuarios (id_sucursal, nombre, apellido, email, password_hash) VALUE
 
 INSERT INTO usuario_roles (id_usuario, id_rol)
 SELECT 1, id_rol FROM roles WHERE nombre = 'ADMIN';
+
+-- Stored Procedure para registrar detalle de venta y descontar inventario
+-- Uso recomendado: insertar encabezado en `ventas` y luego cada partida con este SP.
+DELIMITER $$
+CREATE PROCEDURE sp_registrar_detalle_venta (
+  IN p_id_venta BIGINT,
+  IN p_id_producto INT,
+  IN p_cantidad DECIMAL(12,2),
+  IN p_precio_unitario DECIMAL(12,2),
+  IN p_descuento_linea DECIMAL(12,2),
+  IN p_impuesto_linea DECIMAL(12,2)
+)
+BEGIN
+  DECLARE EXIT HANDLER FOR SQLEXCEPTION
+  BEGIN
+    ROLLBACK;
+    RESIGNAL;
+  END;
+
+  DECLARE v_id_sucursal INT;
+  DECLARE v_estado VARCHAR(10);
+  DECLARE v_stock_actual DECIMAL(12,2);
+  DECLARE v_total_linea DECIMAL(12,2);
+
+  IF p_cantidad <= 0 THEN
+    SIGNAL SQLSTATE '45000'
+      SET MESSAGE_TEXT = 'La cantidad debe ser mayor a cero';
+  END IF;
+
+  START TRANSACTION;
+
+  SELECT id_sucursal, estado
+    INTO v_id_sucursal, v_estado
+  FROM ventas
+  WHERE id_venta = p_id_venta
+  FOR UPDATE;
+
+  IF v_id_sucursal IS NULL THEN
+    SIGNAL SQLSTATE '45000'
+      SET MESSAGE_TEXT = 'La venta no existe';
+  END IF;
+
+  IF v_estado <> 'PAGADA' THEN
+    SIGNAL SQLSTATE '45000'
+      SET MESSAGE_TEXT = 'Solo se puede afectar inventario en ventas PAGADAS';
+  END IF;
+
+  SELECT stock_actual
+    INTO v_stock_actual
+  FROM inventario
+  WHERE id_sucursal = v_id_sucursal
+    AND id_producto = p_id_producto
+  FOR UPDATE;
+
+  IF v_stock_actual IS NULL THEN
+    SIGNAL SQLSTATE '45000'
+      SET MESSAGE_TEXT = 'No existe registro de inventario para el producto en esta sucursal';
+  END IF;
+
+  IF v_stock_actual < p_cantidad THEN
+    SIGNAL SQLSTATE '45000'
+      SET MESSAGE_TEXT = 'Stock insuficiente para completar la venta';
+  END IF;
+
+  SET v_total_linea = (p_cantidad * p_precio_unitario) - p_descuento_linea + p_impuesto_linea;
+
+  INSERT INTO detalle_venta (
+    id_venta,
+    id_producto,
+    cantidad,
+    precio_unitario,
+    descuento_linea,
+    impuesto_linea,
+    total_linea
+  ) VALUES (
+    p_id_venta,
+    p_id_producto,
+    p_cantidad,
+    p_precio_unitario,
+    COALESCE(p_descuento_linea, 0.00),
+    COALESCE(p_impuesto_linea, 0.00),
+    v_total_linea
+  );
+
+  UPDATE inventario
+  SET stock_actual = stock_actual - p_cantidad
+  WHERE id_sucursal = v_id_sucursal
+    AND id_producto = p_id_producto;
+
+  UPDATE ventas
+  SET subtotal = subtotal + (p_cantidad * p_precio_unitario),
+      descuento = descuento + COALESCE(p_descuento_linea, 0.00),
+      impuesto = impuesto + COALESCE(p_impuesto_linea, 0.00),
+      total = total + v_total_linea
+  WHERE id_venta = p_id_venta;
+
+  COMMIT;
+END$$
+DELIMITER ;
